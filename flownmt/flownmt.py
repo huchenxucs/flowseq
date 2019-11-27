@@ -5,8 +5,8 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from apex.parallel import DistributedDataParallel
-from apex.parallel.distributed import flat_dist_call
+# from apex.parallel import DistributedDataParallel
+# from apex.parallel.distributed import flat_dist_call
 
 from flownmt.modules import Encoder
 from flownmt.modules import Posterior
@@ -535,27 +535,27 @@ class FlowNMT(nn.Module):
         core = self._get_core() if eval else self.core
         return core(src_sents, tgt_sents, src_masks, tgt_masks, nsamples=nsamples)
 
-    def init_distributed(self, rank, local_rank):
-        assert not self.distribured_enabled
-        self.distribured_enabled = True
-        print("Initializing Distributed, rank {}, local rank {}".format(rank, local_rank))
-        dist.init_process_group(backend='nccl', rank=rank)
-        torch.cuda.set_device(local_rank)
-        self.core = DistributedDataParallel(self.core)
+    # def init_distributed(self, rank, local_rank):
+    #     assert not self.distribured_enabled
+    #     self.distribured_enabled = True
+    #     print("Initializing Distributed, rank {}, local rank {}".format(rank, local_rank))
+    #     dist.init_process_group(backend='nccl', rank=rank)
+    #     torch.cuda.set_device(local_rank)
+    #     self.core = DistributedDataParallel(self.core)
 
-    def sync_params(self):
-        assert self.distribured_enabled
-        core = self._get_core()
-        flat_dist_call([param.data for param in core.parameters()], dist.all_reduce)
-        self.core.needs_refresh = True
-
-    def enable_allreduce(self):
-        assert self.distribured_enabled
-        self.core.enable_allreduce()
-
-    def disable_allreduce(self):
-        assert self.distribured_enabled
-        self.core.disable_allreduce()
+    # def sync_params(self):
+    #     assert self.distribured_enabled
+    #     core = self._get_core()
+    #     flat_dist_call([param.data for param in core.parameters()], dist.all_reduce)
+    #     self.core.needs_refresh = True
+    #
+    # def enable_allreduce(self):
+    #     assert self.distribured_enabled
+    #     self.core.enable_allreduce()
+    #
+    # def disable_allreduce(self):
+    #     assert self.distribured_enabled
+    #     self.core.disable_allreduce()
 
     def save(self, model_path):
         model = {'core': self._get_core().state_dict()}

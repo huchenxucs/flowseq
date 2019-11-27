@@ -13,7 +13,7 @@ import numpy as np
 
 import torch
 from torch.nn.utils import clip_grad_norm_
-import torch.distributed as dist
+# import torch.distributed as dist
 
 from flownmt.data import NMTDataSet, DataIterator
 from flownmt import FlowNMT
@@ -21,6 +21,7 @@ from flownmt.utils import total_grad_norm
 from flownmt.optim import AdamW, InverseSquareRootScheduler, ExponentialScheduler
 
 from experiments.options import parse_args
+from experiments.logger import FlowSeqLogger
 
 
 def logging(info, logfile):
@@ -150,6 +151,8 @@ def reconstruct(epoch, dataset, dataloader, flownmt, result_path, log):
 def eval(args, epoch, dataset, dataloader, flownmt):
     flownmt.eval()
     flownmt.sync()
+
+    logger = args.logger
     # reconstruct
     reconstruct(epoch, dataset, dataloader, flownmt, args.result_path, args.log)
     # translate
@@ -172,9 +175,12 @@ def eval(args, epoch, dataset, dataloader, flownmt):
     length_loss = length_loss / num_insts
     nll = kl_loss + recon_loss
     ppl = np.exp(nll * num_insts / num_words)
-    logging('Ave  NLL: {:.2f} (recon: {:.2f}, kl: {:.2f}), len: {:.2f}, PPL: {:.2f}, BLEU: {:.2f}'.format(
+    logging('In eval: Ave  NLL: {:.2f} (recon: {:.2f}, kl: {:.2f}), len: {:.2f}, PPL: {:.2f}, BLEU: {:.2f}'.format(
         nll, recon_loss, kl_loss, length_loss, ppl, bleu), args.log)
     logging('-' * 100, args.log)
+
+    logger.log_eval(recon_loss, kl_loss, length_loss, epoch)
+
     return bleu, nll, recon_loss, kl_loss, length_loss, ppl
 
 
@@ -272,6 +278,7 @@ def setup(args):
     args.length_unit = flownmt.length_unit
     args.device = device
     args.steps_per_epoch = 1000
+    args.logger = FlowSeqLogger(os.path.join('log-runs', args.model_path))
 
     return args, dataset, flownmt
 
@@ -351,6 +358,7 @@ def pretrain_model(args, dataset, train_iter, val_iter, flownmt, zero_steps):
     amsgrad = args.amsgrad
     weight_decay = args.weight_decay
     grad_clip = args.grad_clip
+    logger = args.logger
 
     batch_steps = max(1, args.batch_steps // 2)
     log = args.log if args.rank <=0 else None
@@ -370,7 +378,7 @@ def pretrain_model(args, dataset, train_iter, val_iter, flownmt, zero_steps):
     flownmt.train()
     start_time = time.time()
     if args.rank <= 0:
-        logging('Init Epoch: %d, lr=%.6f (%s), betas=(%.1f, %.3f), eps=%.1e, amsgrad=%s, l2=%.1e' % (
+        logging('In pretrain: Init Epoch: %d, lr=%.6f (%s), betas=(%.1f, %.3f), eps=%.1e, amsgrad=%s, l2=%.1e' % (
             1, lr, lr_decay, betas[0], betas[1], eps, amsgrad, weight_decay), log)
 
     for step, (src_sents, tgt_sents, src_masks, tgt_masks) in enumerate(train_iter):
@@ -384,8 +392,8 @@ def pretrain_model(args, dataset, train_iter, val_iter, flownmt, zero_steps):
         src_masks = [src_masks, ] if batch_steps == 1 else src_masks.chunk(batch_steps, dim=0)
         tgt_masks = [tgt_masks, ] if batch_steps == 1 else tgt_masks.chunk(batch_steps, dim=0)
         # disable allreduce for accumulated gradient.
-        if args.rank >= 0:
-            flownmt.disable_allreduce()
+        # if args.rank >= 0:
+        #     flownmt.disable_allreduce()
         for src, tgt, src_mask, tgt_mask in zip(src_sents[:-1], tgt_sents[:-1], src_masks[:-1], tgt_masks[:-1]):
             recon, llen = flownmt.reconstruct_error(src, tgt, src_mask, tgt_mask)
             recon = recon.sum()
@@ -411,9 +419,11 @@ def pretrain_model(args, dataset, train_iter, val_iter, flownmt, zero_steps):
         else:
             loss = (recon + llen).div(batch_size)
         loss.backward()
+
         with torch.no_grad():
             recon_batch += recon.item()
             llen_batch += llen.item()
+            logger.log_pretrain(recon_batch / batch_size, llen_batch / batch_size, loss.item(), lr, step)
 
         if grad_clip > 0:
             grad_norm = clip_grad_norm_(flownmt.parameters(), grad_clip)
@@ -444,7 +454,7 @@ def pretrain_model(args, dataset, train_iter, val_iter, flownmt, zero_steps):
             train_llen = length_loss.item() / nums if nums > 0 else 0
             curr_step = step % steps_per_epoch
             curr_lr = scheduler.get_lr()[0]
-            log_info = '[{}/{} ({:.0f}%) lr={:.6f} {}] recon: {:.2f} ({:.2f}), len: {:.2f}'.format(
+            log_info = 'IN Pretrain: [{}/{} ({:.0f}%) lr={:.6f} {}] recon: {:.2f} ({:.2f}), len: {:.2f}'.format(
                 curr_step, steps_per_epoch, 100. * curr_step / steps_per_epoch, curr_lr, num_nans,
                 train_recon, recon_per_word,
                 train_llen)
@@ -457,11 +467,11 @@ def pretrain_model(args, dataset, train_iter, val_iter, flownmt, zero_steps):
             epoch = step // steps_per_epoch
             lr = scheduler.get_lr()[0]
 
-            if args.rank >= 0:
-                dist.reduce(recon_loss, dst=0, op=dist.ReduceOp.SUM)
-                dist.reduce(length_loss, dst=0, op=dist.ReduceOp.SUM)
-                dist.reduce(num_insts, dst=0, op=dist.ReduceOp.SUM)
-                dist.reduce(num_words, dst=0, op=dist.ReduceOp.SUM)
+            # if args.rank >= 0:
+            #     dist.reduce(recon_loss, dst=0, op=dist.ReduceOp.SUM)
+            #     dist.reduce(length_loss, dst=0, op=dist.ReduceOp.SUM)
+            #     dist.reduce(num_insts, dst=0, op=dist.ReduceOp.SUM)
+            #     dist.reduce(num_words, dst=0, op=dist.ReduceOp.SUM)
 
             if args.rank <= 0:
                 nums = num_insts.item()
@@ -472,7 +482,7 @@ def pretrain_model(args, dataset, train_iter, val_iter, flownmt, zero_steps):
                 sys.stdout.write("\b" * num_back)
                 sys.stdout.write(" " * num_back)
                 sys.stdout.write("\b" * num_back)
-                logging('Average recon: {:.2f}, ({:.2f}), len: {:.2f}, time: {:.1f}s'.format(
+                logging('IN Pretrain: Average recon: {:.2f}, ({:.2f}), len: {:.2f}, time: {:.1f}s'.format(
                     train_recon, recon_per_word, train_llen, time.time() - start_time), log)
                 logging('-' * 100, log)
                 with torch.no_grad():
@@ -484,7 +494,7 @@ def pretrain_model(args, dataset, train_iter, val_iter, flownmt, zero_steps):
                 break
 
             if args.rank <= 0:
-                logging('Init Epoch: %d, lr=%.6f (%s), betas=(%.1f, %.3f), eps=%.1e amsgrad=%s, l2=%.1e' % (
+                logging('IN pretrain: Init Epoch: %d, lr=%.6f (%s), betas=(%.1f, %.3f), eps=%.1e amsgrad=%s, l2=%.1e' % (
                         epoch + 1, lr, lr_decay, betas[0], betas[1], eps, amsgrad, weight_decay), log)
 
             recon_loss = torch.Tensor([0.]).to(device)
@@ -504,6 +514,7 @@ def train(args, dataset, train_iter, val_iter, test_iter, flownmt):
     train_k = args.train_k
     grad_clip = args.grad_clip
     batch_steps = args.batch_steps
+    logger = args.logger
 
     device = args.device
     log = args.log if args.rank <=0 else None
@@ -549,7 +560,7 @@ def train(args, dataset, train_iter, val_iter, test_iter, flownmt):
 
         if args.rank <= 0:
             with torch.no_grad():
-                logging('Evaluating after resuming model...', log)
+                logging('In train: Evaluating after resuming model...', log)
                 eval(args, epoch, dataset, val_iter, flownmt)
     else:
         optimizer, scheduler = get_optimizer(args.lr, flownmt.parameters(), betas, eps, amsgrad=amsgrad,
@@ -579,7 +590,7 @@ def train(args, dataset, train_iter, val_iter, test_iter, flownmt):
     flownmt.train()
     start_time = time.time()
     if args.rank <= 0:
-        logging('Epoch: %d (lr=%.6f (%s), betas=(%.1f, %.3f), eps=%.1e, amsgrad=%s, l2=%.1e, train_k=%d)' % (
+        logging('In train: Epoch: %d (lr=%.6f (%s), betas=(%.1f, %.3f), eps=%.1e, amsgrad=%s, l2=%.1e, train_k=%d)' % (
             epoch + 1, lr, lr_decay, betas[0], betas[1], eps, amsgrad, weight_decay, train_k), log)
 
     for step, (src_sents, tgt_sents, src_masks, tgt_masks) in enumerate(train_iter):
@@ -633,6 +644,8 @@ def train(args, dataset, train_iter, val_iter, test_iter, flownmt):
             recon_batch += recon.item()
             kl_batch += kl.item()
             llen_batch += llen.item()
+            logger.log_training(recon_batch / batch_size, kl_batch / batch_size, llen_batch / batch_size,
+                                kl_batch / batch_size * kl_weight, loss.item(), lr, kl_weight, batch_size, step)
 
         if grad_clip > 0:
             grad_norm = clip_grad_norm_(flownmt.parameters(), grad_clip)
@@ -666,7 +679,7 @@ def train(args, dataset, train_iter, val_iter, test_iter, flownmt):
             train_ppl = float('inf') if train_ppl > 10000 else train_ppl
             curr_lr = scheduler.get_lr()[0]
             curr_step = step if step == steps_per_epoch else step % steps_per_epoch
-            log_info = '[{}/{} ({:.0f}%) lr={:.6f}, klw={:.2f} {}] NLL: {:.2f} (recon: {:.2f}, kl: {:.2f}), len: {:.2f}, PPL: {:.2f}'.format(
+            log_info = 'In train: [{}/{} ({:.0f}%) lr={:.6f}, klw={:.2f} {}] NLL: {:.2f} (recon: {:.2f}, kl: {:.2f}), len: {:.2f}, PPL: {:.2f}'.format(
                 curr_step, steps_per_epoch, 100. * curr_step / steps_per_epoch, curr_lr, kl_weight, num_nans,
                 train_nll, train_recon, train_kl, train_llen, train_ppl)
             sys.stdout.write(log_info)
@@ -678,12 +691,12 @@ def train(args, dataset, train_iter, val_iter, test_iter, flownmt):
             epoch = step // steps_per_epoch
             lr = scheduler.get_lr()[0]
 
-            if args.rank >= 0:
-                dist.reduce(recon_loss, dst=0, op=dist.ReduceOp.SUM)
-                dist.reduce(kl_loss, dst=0, op=dist.ReduceOp.SUM)
-                dist.reduce(length_loss, dst=0, op=dist.ReduceOp.SUM)
-                dist.reduce(num_insts, dst=0, op=dist.ReduceOp.SUM)
-                dist.reduce(num_words, dst=0, op=dist.ReduceOp.SUM)
+            # if args.rank >= 0:
+            #     dist.reduce(recon_loss, dst=0, op=dist.ReduceOp.SUM)
+            #     dist.reduce(kl_loss, dst=0, op=dist.ReduceOp.SUM)
+            #     dist.reduce(length_loss, dst=0, op=dist.ReduceOp.SUM)
+            #     dist.reduce(num_insts, dst=0, op=dist.ReduceOp.SUM)
+            #     dist.reduce(num_words, dst=0, op=dist.ReduceOp.SUM)
 
             if args.rank <= 0:
                 nums = num_insts.item()
@@ -697,12 +710,12 @@ def train(args, dataset, train_iter, val_iter, test_iter, flownmt):
                 sys.stdout.write("\b" * num_back)
                 sys.stdout.write(" " * num_back)
                 sys.stdout.write("\b" * num_back)
-                logging('Average NLL: {:.2f} (recon: {:.2f}, kl: {:.2f}), len: {:.2f}, PPL: {:.2f}, time: {:.1f}s'.format(
+                logging('In train: Average NLL: {:.2f} (recon: {:.2f}, kl: {:.2f}), len: {:.2f}, PPL: {:.2f}, time: {:.1f}s'.format(
                     train_nll, train_recon, train_kl, train_llen, train_ppl, time.time() - start_time), log)
                 logging('-' * 100, log)
 
                 with torch.no_grad():
-                    logging('Evaluating validation data...', log)
+                    logging('In train: Evaluating validation data...', log)
                     bleu, nll, recon, kl, llen, ppl = eval(args, epoch, dataset, val_iter, flownmt)
                     if bleu > best_bleu or best_epoch == 0 or ppl < best_ppl:
                         flownmt.save(args.model_path)
@@ -714,12 +727,12 @@ def train(args, dataset, train_iter, val_iter, test_iter, flownmt):
                         best_llen = llen
                         best_ppl = ppl
 
-                        logging('Evaluating test data...', log)
+                        logging('In train: Evaluating test data...', log)
                         test_bleu, test_nll, test_recon, test_kl, test_llen, test_ppl = eval(args, epoch, dataset, test_iter, flownmt)
 
-                logging('Best Dev  NLL: {:.2f} (recon: {:.2f}, kl: {:.2f}), len: {:.2f}, PPL: {:.2f}, BLEU: {:.2f}, epoch: {}'.format(
+                logging('In train: Best Dev  NLL: {:.2f} (recon: {:.2f}, kl: {:.2f}), len: {:.2f}, PPL: {:.2f}, BLEU: {:.2f}, epoch: {}'.format(
                     best_nll, best_recon, best_kl, best_llen, best_ppl, best_bleu, best_epoch), log)
-                logging('Best Test NLL: {:.2f} (recon: {:.2f}, kl: {:.2f}), len: {:.2f}, PPL: {:.2f}, BLEU: {:.2f}, epoch: {}'.format(
+                logging('In train: Best Test NLL: {:.2f} (recon: {:.2f}, kl: {:.2f}), len: {:.2f}, PPL: {:.2f}, BLEU: {:.2f}, epoch: {}'.format(
                     test_nll, test_recon, test_kl, test_llen, test_ppl, test_bleu, best_epoch), log)
                 logging('=' * 100, log)
 
@@ -742,7 +755,7 @@ def train(args, dataset, train_iter, val_iter, test_iter, flownmt):
                 break
 
             if args.rank <= 0:
-                logging('Epoch: %d (lr=%.6f (%s), betas=(%.1f, %.3f), eps=%.1e, amsgrad=%s, l2=%.1e, train_k=%d)' % (
+                logging('In train:  Epoch: %d (lr=%.6f (%s), betas=(%.1f, %.3f), eps=%.1e, amsgrad=%s, l2=%.1e, train_k=%d)' % (
                     epoch + 1, lr, lr_decay, betas[0], betas[1], eps, amsgrad, weight_decay, train_k), log)
 
             recon_loss = torch.Tensor([0.]).to(device)
@@ -774,24 +787,24 @@ def main(args):
             with torch.no_grad():
                 reconstruct(0, dataset, val_iter, flownmt, args.result_path, args.log)
                 logging('-' * 100, args.log)
-
-    if args.rank >= 0:
-        flownmt.init_distributed(args.rank, args.local_rank)
+    #
+    # if args.rank >= 0:
+    #     flownmt.init_distributed(args.rank, args.local_rank)
 
     if pretrain:
         init_posterior(args, train_iter, flownmt)
     elif args.recover < 0:
         init_model(args, train_iter, flownmt)
 
-    if args.rank >= 0:
-        flownmt.sync_params()
+    # if args.rank >= 0:
+    #     flownmt.sync_params()
 
     if pretrain:
         zero_steps = args.init_steps
         pretrain_model(args, dataset, train_iter, val_iter, flownmt, zero_steps)
         init_prior(args, train_iter, flownmt)
-        if args.rank >= 0:
-            flownmt.sync_params()
+        # if args.rank >= 0:
+        #     flownmt.sync_params()
         if args.rank <= 0:
             flownmt.save_core(checkpoint_name)
 
@@ -800,5 +813,5 @@ def main(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    assert args.rank == -1 and args.local_rank == 0, 'single process should have wrong rank ({}) or local rank ({})'.format(args.rank, args.local_rank)
+    assert args.rank == -1  # and args.local_rank == 0, 'single process should have wrong rank ({}) or local rank ({})'.format(args.rank, args.local_rank)
     main(args)
