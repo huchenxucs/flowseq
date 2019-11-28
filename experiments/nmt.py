@@ -156,13 +156,14 @@ def eval(args, epoch, dataset, dataloader, flownmt):
     # reconstruct
     reconstruct(epoch, dataset, dataloader, flownmt, args.result_path, args.log)
     # translate
-    bleu = translate(epoch, dataset, dataloader, flownmt, args.result_path, args.log)
+    # bleu = translate(epoch, dataset, dataloader, flownmt, args.result_path, args.log)
+    bleu = 0
     recon_loss = 0.
     kl_loss = 0.
     length_loss = 0.
     num_insts = 0
     num_words = 0
-    test_k = 3
+    test_k = 1
     for src, tgt, src_masks, tgt_masks in dataloader:
         recon, kl, llen = flownmt.loss(src, tgt, src_masks, tgt_masks, nsamples=test_k, eval=True)
         recon_loss += recon.sum().item()
